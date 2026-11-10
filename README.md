@@ -37,3 +37,7 @@ Run it from cron, for example daily at 07:00:
 
 The source tree runs without installing: after `make`, `bin/zimdiff` uses
 `etc/` and `var/` of the tree.
+
+## Credits
+
+The initial code was written by Tobi Oetiker <tobi@oetiker.ch>.
