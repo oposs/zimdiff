@@ -17,8 +17,9 @@
       "someone@example.com"
     ],
     "from": "Zimbra Calendar Changes <no-reply@example.com>",
-    "subject": "Kalender-Änderungen",
+    "subject": "Calendar changes",
     "always": false,
     "smtp": null
-  }
+  },
+  "language": "en"
 }
