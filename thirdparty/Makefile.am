@@ -22,3 +22,6 @@ install-exec-local:
 
 clean-local:
 	rm -rf lib bin .cpanm touch
+
+uninstall-local:
+	cd lib/perl5 && find . -type f | while read f; do rm -f "$(DESTDIR)$(libdir)/$$f"; done
