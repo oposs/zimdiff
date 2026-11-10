@@ -11,12 +11,13 @@ use Mojo::Template;
 use Mojo::Util qw(url_escape);
 use POSIX qw(strftime);
 use Storable qw(retrieve nstore);
+use Time::Local qw(timegm);
 use MIME::Base64 qw(encode_base64);
 use Encode qw(encode_utf8);
 use Getopt::Long 2.25 qw(:config posix_default no_ignore_case);
 use Pod::Usage 1.14;
 
-our $VERSION = '2.0.1'; # VERSION
+our $VERSION = '2.1.0'; # VERSION
 
 my $ROOT = path($FindBin::RealBin)->dirname;
 
@@ -68,7 +69,7 @@ binmode STDERR, ':encoding(UTF-8)';
 
 sub main {
     GetOptions(\%opt, 'help|h', 'man', 'version', 'noaction|no-action|n',
-        'nomail|no-mail|M', 'html=s', 'config|c=s', 'verbose|v', 'login', 'otp=s')
+        'nomail|no-mail|M', 'html=s', 'config|c=s', 'verbose|v')
         or exit 1;
     pod2usage(1) if $opt{help};
     pod2usage(-exitstatus => 0, -verbose => 2) if $opt{man};
@@ -91,22 +92,7 @@ sub main {
     my $ua = Mojo::UserAgent->new(
         connect_timeout => 20, request_timeout => 120);
 
-    if ($opt{login}) {
-        login($ua, $cfg, $var, 1);
-        say "Login OK";
-        exit 0;
-    }
-
-    my @report;
-    my $token = eval { login($ua, $cfg, $var) };
-    if (my $err = $@) {
-        chomp $err;
-        @report = map { { calendar => $_->{name} // $_->{path},
-            changes => [], error => "Login: $err" } } @cals;
-    }
-    else {
-        push @report, check_calendar($ua, $cfg, $var, $token, $_) for @cals;
-    }
+    my @report = map { check_calendar($ua, $cfg, $var, $_) } @cals;
 
     my $changes = 0;
     $changes += $_->{error} ? 1 : scalar @{$_->{changes}} for @report;
@@ -176,83 +162,107 @@ sub base_url ($cfg) {
     return $url->path('/')->query('')->fragment(undef);
 }
 
-# Log in with the JSON flavour of the SOAP API and return the auth token.
-# Accounts with two factor authentication need a trusted token, stored in
-# var/zimbra.trusted; with $interactive the OTP is asked for and a new
-# trusted token is saved.
-sub login ($ua, $cfg, $var, $interactive = 0) {
-    my $z       = $cfg->{zimbra};
-    my $trusted = $var->child('zimbra.trusted');
-    my %req = (
-        _jsns    => 'urn:zimbraAccount',
-        account  => { by => 'name', _content => $z->{user} },
-        password => { _content => $z->{password} },
-    );
-    if (!$interactive and -r $trusted) {
-        $req{trustedToken} = { _content => $trusted->slurp =~ s/\s+//gr };
-    }
-    my $auth = auth_request($ua, $cfg, \%req);
-
-    if ((content($auth->{twoFactorAuthRequired}) // '') eq 'true') {
-        die "two factor code required, run 'zimdiff --login'\n"
-            unless $interactive and ($opt{otp} or -t STDIN);
-        my $otp = $opt{otp};
-        unless ($otp) {
-            print STDERR "OTP for $z->{user}: ";
-            chomp($otp = <STDIN> // '');
-        }
-        die "no OTP given\n" unless $otp =~ /\S/;
-        delete $req{trustedToken};
-        $auth = auth_request($ua, $cfg, { %req,
-            twoFactorCode => { _content => $otp }, deviceTrusted => 1 });
-        my $new = content($auth->{trustedToken})
-            or die "Zimbra did not return a trusted token\n";
-        write_file("$trusted", $new, 0600);
-    }
-    my $token = content($auth->{authToken});
-    die "Zimbra did not return an auth token\n" unless $token;
-    return $token;
+sub ical_utc ($ms) {
+    return strftime('%Y%m%dT%H%M%SZ', gmtime int($ms / 1000));
 }
 
-sub auth_request ($ua, $cfg, $req) {
-    my $tx = $ua->post(base_url($cfg)->path('/service/soap/') => json => {
-        Header => { context => { _jsns => 'urn:zimbra', nosession => {} } },
-        Body   => { AuthRequest => $req },
-    });
-    my $res  = $tx->res;
-    my $json = $res->json // {};
-    if (my $fault = $json->{Body}{Fault}) {
-        die(($fault->{Reason}{Text} // 'unknown fault') . "\n");
-    }
+# Read the events of one calendar through CalDAV. Zimbra accepts application
+# passcodes for CalDAV, but not for its SOAP and REST interfaces.
+sub fetch ($ua, $cfg, $cal, $start, $end = undef) {
+    my $z   = $cfg->{zimbra};
+    my $url = base_url($cfg);
+    $url->userinfo("$z->{user}:$z->{password}");
+    push @{$url->path->parts}, 'dav', (split m{/}, $cal), '';
+    my $range = 'start="' . ical_utc($start) . '"'
+        . (defined $end ? ' end="' . ical_utc($end) . '"' : '');
+    my $query = <<"EOQ";
+<?xml version="1.0" encoding="utf-8"?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/><C:calendar-data/></D:prop>
+  <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
+    <C:time-range $range/>
+  </C:comp-filter></C:comp-filter></C:filter>
+</C:calendar-query>
+EOQ
+    my $tx = $ua->start($ua->build_tx(REPORT => $url => {
+        Depth => 1, 'Content-Type' => 'application/xml; charset=utf-8',
+    } => $query));
+    my $res = $tx->res;
     if (my $err = $tx->error) {
         die(($err->{code} ? "HTTP $err->{code} " : '') . "$err->{message}\n");
     }
-    return $json->{Body}{AuthResponse}
-        // die "no AuthResponse from Zimbra\n";
+    die "Unexpected answer from Zimbra (HTTP " . $res->code . ")\n"
+        unless $res->code == 207;
+    my @entries;
+    for my $r ($res->dom->find('response')->each) {
+        my $data = $r->at('calendar-data') or next;
+        my $etag = $r->at('getetag');
+        my $entry = entry(parse_ics($data->text), $etag ? $etag->text : '')
+            or next;
+        push @entries, $entry;
+    }
+    return \@entries;
 }
 
-# SOAP values come as plain value, as { _content => ... } or as a list
-sub content ($v) {
-    $v = $v->[0] if ref $v eq 'ARRAY';
-    $v = $v->{_content} if ref $v eq 'HASH';
+# The events of one calendar object as a list of { NAME => { value, PARAM } }.
+sub parse_ics ($text) {
+    $text =~ s/\r?\n[ \t]//g;    # unfold continuation lines
+    my (@events, $ev, $depth);
+    for my $line (split /\r?\n/, $text) {
+        if ($line =~ /^BEGIN:(\w+)/) {
+            if ($1 eq 'VEVENT' and not $ev) { $ev = {}; $depth = 0; next }
+            $depth++ if $ev;
+            next;
+        }
+        if ($line =~ /^END:(\w+)/) {
+            if ($ev and $1 eq 'VEVENT' and !$depth) { push @events, $ev; undef $ev; next }
+            $depth-- if $ev;
+            next;
+        }
+        next unless $ev and !$depth;    # skip VALARM and the like
+        my ($name, $params, $value) =
+            $line =~ /^([A-Za-z0-9-]+)((?:;[^:;=]+=(?:"[^"]*"|[^:;"]*))*):(.*)$/
+            or next;
+        my %p = (value => $value);
+        while ($params =~ /;([^=]+)=("[^"]*"|[^;]*)/g) {
+            my ($k, $v) = (uc $1, $2);
+            $v =~ s/^"(.*)"$/$1/;
+            $p{$k} = $v;
+        }
+        $ev->{uc $name} //= \%p;
+    }
+    return \@events;
+}
+
+sub ics_text ($prop) {
+    return undef unless $prop;
+    my $v = $prop->{value};
+    $v =~ s/\\n/\n/gi;
+    $v =~ s/\\([,;\\])/$1/g;
     return $v;
 }
 
-sub fetch ($ua, $cfg, $token, $cal, %query) {
-    my $url = base_url($cfg);
-    push @{$url->path->parts}, 'home', split m{/}, $cal;
-    $url->query(fmt => 'json', %query);
-    my $tx  = $ua->get($url => { Cookie => "ZM_AUTH_TOKEN=$token" });
-    if (my $err = $tx->error) {
-        die(($err->{code} ? "HTTP $err->{code} " : '') . "$err->{message}\n");
-    }
-    my $json = $tx->res->json;
-    die "Unexpected answer from Zimbra (no JSON)\n"
-        unless ref $json eq 'HASH';
-    return $json->{appt} // [];
+# DTSTART / DTEND as { u => epoch ms } or, for dates, { d => YYYYMMDD }
+sub ics_time ($prop) {
+    return undef unless $prop;
+    my $v = $prop->{value};
+    return { d => $1 } if $v =~ /^(\d{8})$/;
+    my ($Y, $M, $D, $h, $m, $s, $z) =
+        $v =~ /^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)(Z?)$/ or return undef;
+    my @tm = ($s, $m, $h, $D, $M - 1, $Y - 1900);
+    return { u => timegm(@tm) * 1000 } if $z;
+    my $tzid = $prop->{TZID} // '';
+    my $saved = $ENV{TZ};
+    $ENV{TZ} = $tzid if $tzid =~ m{^[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*$}
+        and -e "/usr/share/zoneinfo/$tzid";
+    POSIX::tzset();
+    my $epoch = POSIX::mktime(@tm, 0, 0, -1);
+    if (defined $saved) { $ENV{TZ} = $saved } else { delete $ENV{TZ} }
+    POSIX::tzset();
+    return { u => $epoch * 1000 };
 }
 
-sub check_calendar ($ua, $cfg, $var, $token, $c) {
+sub check_calendar ($ua, $cfg, $var, $c) {
     my $cal   = $c->{path};
     my $res   = { calendar => $c->{name} // $cal, changes => [] };
     my $store = $var->child(url_escape($cal, '^A-Za-z0-9\-_.') . '.store');
@@ -264,13 +274,16 @@ sub check_calendar ($ua, $cfg, $var, $token, $c) {
         $res->{error} = "Cannot read state $store: $err";
         return $res;
     }
+    # state of zimdiff 2.0.x came from the REST interface, with other ids;
+    # start over instead of reporting every appointment as deleted and new
+    $old = undef if $old and grep { ($_->{v} // 0) < 3 } values %$old;
     my $mtime = $old ? (stat $store)[9] * 1000 : undef;
 
     my ($current, $past) = eval {
-        my $cur  = fetch($ua, $cfg, $token, $cal, start => $now);
+        my $cur  = fetch($ua, $cfg, $cal, $now);
         # appointments that moved into the past since the last run are
         # not deletions, so fetch them as well for the comparison
-        my $past = $mtime ? fetch($ua, $cfg, $token, $cal, start => $mtime, end => $now) : [];
+        my $past = $mtime ? fetch($ua, $cfg, $cal, $mtime, $now) : [];
         ($cur, $past);
     };
     if (my $err = $@) {
@@ -279,7 +292,7 @@ sub check_calendar ($ua, $cfg, $var, $token, $c) {
         return $res;
     }
 
-    my $new = { map { $_->{id} => entry($_) } @$current };
+    my $new = { map { $_->{id} => $_ } @$current };
     $res->{count} = scalar keys %$new;
 
     $res->{save} = [ $store, $new ];
@@ -289,7 +302,7 @@ sub check_calendar ($ua, $cfg, $var, $token, $c) {
         return $res;
     }
 
-    my $cmp = { %$new, map { $_->{id} => entry($_) } @$past };
+    my $cmp = { %$new, map { $_->{id} => $_ } @$past };
     my @ch;
     for my $id (keys %$cmp) {
         my ($n, $o) = ($cmp->{$id}, $old->{$id});
@@ -320,30 +333,38 @@ sub check_calendar ($ua, $cfg, $var, $token, $c) {
     return $res;
 }
 
-# the state keeps the raw values; view() formats them for the report, so
-# a change of the report language does not show up as a changed field
-sub entry ($appt) {
-    my $det = $appt->{inv}[0]{comp}[0] // {};
-    my ($s, $e) = ($det->{s}[0], $det->{e}[0]);
-    my $org = $det->{or};
-    my $time = sub ($t) { $t ? { map { $_ => $t->{$_} } grep { defined $t->{$_} } qw(u d) } : undef };
+# The state keeps raw values; view() formats them for the report, so a change
+# of the report language does not show up as a changed field.
+sub entry ($events, $etag) {
+    # a series with exceptions holds one VEVENT per exception; the master
+    # has no RECURRENCE-ID
+    my ($ev) = grep({ !$_->{'RECURRENCE-ID'} } @$events);
+    $ev //= $events->[0] or return undef;
+    my $uid = $ev->{UID} ? $ev->{UID}{value} : return undef;
+    my ($s, $e) = (ics_time($ev->{DTSTART}), ics_time($ev->{DTEND}));
+    my $allday = $s && $s->{d} ? 1 : 0;
+    if ($allday and $e and $e->{d}) {
+        # the end date of an all-day event is exclusive
+        my ($Y, $M, $D) = $e->{d} =~ /^(\d{4})(\d\d)(\d\d)$/;
+        my $last = strftime('%Y%m%d', 0, 0, 12, $D - 1, $M - 1, $Y - 1900);
+        $e = $last gt $s->{d} ? { d => $last } : undef;
+    }
+    my $org = $ev->{ORGANIZER};
     return {
-        v      => 2,
-        id     => $appt->{id},
-        rev    => $appt->{rev} // '',
-        s      => $time->($s),
-        e      => $time->($e),
-        allday => ($det->{allDay} or ($s && !$s->{u} && ($s->{d} // '') =~ /^\d{8}$/)) ? 1 : 0,
-        recur  => $det->{recur} ? 1 : 0,
-        name   => $det->{name},
-        loc    => $det->{loc} // '',
-        org    => $org ? ($org->{d} // $org->{a} // '') : '',
+        v      => 3,
+        id     => $uid,
+        rev    => $etag,
+        s      => $s,
+        e      => $e,
+        allday => $allday,
+        recur  => $ev->{RRULE} ? 1 : 0,
+        name   => ics_text($ev->{SUMMARY}),
+        loc    => ics_text($ev->{LOCATION}) // '',
+        org    => $org ? ($org->{CN} // ($org->{value} =~ s/^mailto://ir)) : '',
     };
 }
 
 sub view ($x) {
-    # state written by zimdiff 2.0.0 holds formatted text already
-    return { sort => '', %$x } unless $x->{v};
     my ($start, $end) = (tmfmt($x->{s}) // '?', tmfmt($x->{e}) // '');
     if ($x->{allday}) {
         $end = '' if $end eq $start;
@@ -363,7 +384,6 @@ sub view ($x) {
 
 # end of an appointment in ms; an all-day end date counts to the end of the day
 sub end_ms ($x) {
-    return $x->{sort} ? 0 + $x->{sort} : undef unless $x->{v};  # 2.0.0 state: start only
     my $t = $x->{e} // $x->{s} // return undef;
     return $t->{u} if $t->{u};
     my $ms = 0 + sortkey($t) or return undef;
@@ -610,9 +630,6 @@ B<zimdiff> [I<options>...] [I<calendar>...]
  -M, --no-mail       do not send mail
      --html=FILE     also write the HTML report to FILE
  -v, --verbose       report whether mail was sent
-     --login         log in interactively (asks for the OTP of
-                     two factor accounts) and store a trusted token
-     --otp=CODE      OTP for --login instead of asking for it
      --version       print version and exit
  -h, --help          display this help and exit
      --man           show man-page and exit
@@ -635,10 +652,9 @@ I<localstatedir>F</zimdiff>.
 The first run for a calendar only stores its state and reports the
 number of appointments.
 
-For accounts with two factor authentication run B<zimdiff --login> once on
-a terminal. It asks for the OTP and stores the trusted token returned by
-Zimbra in F<var/zimbra.trusted>. Unattended runs use that token. When it
-expires, the report says so and B<--login> has to be repeated.
+zimdiff reads the calendars through CalDAV. For an account with two factor
+authentication, create an application passcode in the Zimbra preferences
+and use it as C<zimbra.password>.
 
 =head1 CONFIGURATION
 
@@ -648,7 +664,7 @@ F<etc/zimdiff.conf> is a JSON file, see F<etc/zimdiff.conf.dist>.
   zimbra.user      account used to log in, for example you@example.com; it
                    must be able to read the calendars, for example
                    because they are shared with it
-  zimbra.password  its password
+  zimbra.password  its password, or an application passcode
   calendars        calendars checked when none are given on the
                    command line, as "owner/Folder" strings or as
                    objects { "path": "owner/Folder", "name": "Label" }
@@ -683,6 +699,6 @@ The initial code was written by Tobi Oetiker E<lt>tobi@oetiker.chE<gt>.
 
  2012-02-23    Initial version
  2026-11-10    Config file, HTML mail, self-contained layout
- 2026-11-10    2.0.1: state keeps raw values, mail before saving state
+ 2026-11-10    2.1.0: CalDAV with application passcode, no SOAP login
 
 =cut

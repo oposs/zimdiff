@@ -25,9 +25,12 @@ cd /opt/zimdiff
 cp etc/zimdiff.conf.dist etc/zimdiff.conf
 chmod 600 etc/zimdiff.conf
 $EDITOR etc/zimdiff.conf
-bin/zimdiff --login    # asks for the OTP if the account uses two factor authentication
 bin/zimdiff            # first run stores the current state
 ```
+
+zimdiff reads the calendars through CalDAV. If the account uses two factor
+authentication, create an application passcode in the Zimbra preferences and
+put it in `zimbra.password`.
 
 Run it from cron, for example daily at 07:00:
 
