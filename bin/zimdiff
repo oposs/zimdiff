@@ -1,0 +1,587 @@
+#!/usr/bin/env perl
+
+use FindBin;
+use lib "$FindBin::RealBin/../thirdparty/lib/perl5"; # LIBDIR
+use Mojo::Base -strict, -signatures;
+use Mojo::UserAgent;
+use Mojo::URL;
+use Mojo::File qw(path);
+use Mojo::JSON qw(decode_json);
+use Mojo::Template;
+use Mojo::Util qw(url_escape);
+use POSIX qw(strftime);
+use Storable qw(retrieve nstore);
+use MIME::Base64 qw(encode_base64);
+use Encode qw(encode_utf8);
+use Getopt::Long 2.25 qw(:config posix_default no_ignore_case);
+use Pod::Usage 1.14;
+
+our $VERSION = '2.0.0'; # VERSION
+
+my $ROOT = path($FindBin::RealBin)->dirname;
+
+# fields that are shown and compared; label for display
+my @FIELDS = (
+    [ start => 'Beginn'   ],
+    [ end   => 'Ende'     ],
+    [ recur => 'Serie'    ],
+    [ name  => 'Titel'    ],
+    [ loc   => 'Ort'      ],
+    [ org   => 'Organisator' ],
+);
+
+my %opt = (config => "$ROOT/etc/zimdiff.conf"); # CONFFILE
+
+binmode STDOUT, ':encoding(UTF-8)';
+binmode STDERR, ':encoding(UTF-8)';
+
+sub main {
+    GetOptions(\%opt, 'help|h', 'man', 'version', 'noaction|no-action|n',
+        'nomail|no-mail|M', 'html=s', 'config|c=s', 'verbose|v', 'login', 'otp=s')
+        or exit 1;
+    pod2usage(1) if $opt{help};
+    pod2usage(-exitstatus => 0, -verbose => 2) if $opt{man};
+    if ($opt{version}) { say "zimdiff $VERSION"; exit 0 }
+
+    my $cfg = load_config($opt{config});
+    $ENV{TZ} = $cfg->{timezone} if $cfg->{timezone};
+    POSIX::tzset();
+
+    my $var = path($cfg->{cache_dir} // "$ROOT/var"); # VARDIR
+    $var = $ROOT->child($var) unless $var->is_abs;
+    $var->make_path;
+
+    my @cals = map { ref $_ ? $_ : { path => $_ } }
+        @ARGV ? @ARGV : @{$cfg->{calendars} // []};
+    @cals = ({ path => "$cfg->{zimbra}{user}/Calendar" }) unless @cals;
+
+    my $ua = Mojo::UserAgent->new(
+        connect_timeout => 20, request_timeout => 120);
+
+    if ($opt{login}) {
+        login($ua, $cfg, $var, 1);
+        say "Login OK";
+        exit 0;
+    }
+
+    my @report;
+    my $token = eval { login($ua, $cfg, $var) };
+    if (my $err = $@) {
+        chomp $err;
+        @report = map { { calendar => $_->{name} // $_->{path},
+            changes => [], error => "Login: $err" } } @cals;
+    }
+    else {
+        push @report, check_calendar($ua, $cfg, $var, $token, $_) for @cals;
+    }
+
+    my $changes = 0;
+    $changes += $_->{error} ? 1 : scalar @{$_->{changes}} for @report;
+
+    print text_report(\@report);
+
+    # the mail only lists calendars with something to report
+    my @mailrep = grep { $_->{error} or $_->{initialized} or @{$_->{changes}} }
+        @report;
+    my $html = html_report(\@mailrep, $cfg);
+    path($opt{html})->spew(encode_utf8($html)) if $opt{html};
+
+    my $mail = $cfg->{mail} // {};
+    my $to = ref $mail->{to} ? $mail->{to} : [ $mail->{to} // () ];
+    if ($opt{nomail} or $opt{noaction} or not @$to) {
+        say "(no mail sent)" if $opt{verbose};
+    }
+    elsif ($changes or $mail->{always}) {
+        send_mail($mail, subject(\@report, $mail), text_report(\@mailrep), $html);
+        say "Mail sent to " . join(', ', @$to)
+            if $opt{verbose};
+    }
+    exit(grep({ $_->{error} } @report) ? 2 : 0);
+}
+
+sub load_config ($file) {
+    die "Config file $file not found (see etc/zimdiff.conf.dist)\n"
+        unless -r $file;
+    my $mode = (stat $file)[2] & 07777;
+    warn "WARNING: $file is readable by others (chmod 600 recommended)\n"
+        if $mode & 0044;
+    my $cfg = eval { decode_json(path($file)->slurp) }
+        or die "Cannot parse $file: $@";
+    for my $key (qw(url user password)) {
+        die "Missing zimbra.$key in $file\n" unless $cfg->{zimbra}{$key};
+    }
+    return $cfg;
+}
+
+sub base_url ($cfg) {
+    my $url = Mojo::URL->new($cfg->{zimbra}{url});
+    return $url->path('/')->query('')->fragment(undef);
+}
+
+# Log in with the JSON flavour of the SOAP API and return the auth token.
+# Accounts with two factor authentication need a trusted token, stored in
+# var/zimbra.trusted; with $interactive the OTP is asked for and a new
+# trusted token is saved.
+sub login ($ua, $cfg, $var, $interactive = 0) {
+    my $z       = $cfg->{zimbra};
+    my $trusted = $var->child('zimbra.trusted');
+    my %req = (
+        _jsns    => 'urn:zimbraAccount',
+        account  => { by => 'name', _content => $z->{user} },
+        password => { _content => $z->{password} },
+    );
+    if (!$interactive and -r $trusted) {
+        $req{trustedToken} = { _content => $trusted->slurp =~ s/\s+//gr };
+    }
+    my $auth = auth_request($ua, $cfg, \%req);
+
+    if ((content($auth->{twoFactorAuthRequired}) // '') eq 'true') {
+        die "two factor code required, run 'zimdiff --login'\n"
+            unless $interactive and ($opt{otp} or -t STDIN);
+        my $otp = $opt{otp};
+        unless ($otp) {
+            print STDERR "OTP for $z->{user}: ";
+            chomp($otp = <STDIN> // '');
+        }
+        die "no OTP given\n" unless $otp =~ /\S/;
+        delete $req{trustedToken};
+        $auth = auth_request($ua, $cfg, { %req,
+            twoFactorCode => { _content => $otp }, deviceTrusted => 1 });
+        my $new = content($auth->{trustedToken})
+            or die "Zimbra did not return a trusted token\n";
+        my $tmp = $var->child('zimbra.trusted.tmp');
+        $tmp->spew($new)->chmod(0600)->move_to($trusted);
+    }
+    my $token = content($auth->{authToken});
+    die "Zimbra did not return an auth token\n" unless $token;
+    return $token;
+}
+
+sub auth_request ($ua, $cfg, $req) {
+    my $tx = $ua->post(base_url($cfg)->path('/service/soap/') => json => {
+        Header => { context => { _jsns => 'urn:zimbra', nosession => {} } },
+        Body   => { AuthRequest => $req },
+    });
+    my $res  = $tx->res;
+    my $json = $res->json // {};
+    if (my $fault = $json->{Body}{Fault}) {
+        die(($fault->{Reason}{Text} // 'unknown fault') . "\n");
+    }
+    if (my $err = $tx->error) {
+        die(($err->{code} ? "HTTP $err->{code} " : '') . "$err->{message}\n");
+    }
+    return $json->{Body}{AuthResponse}
+        // die "no AuthResponse from Zimbra\n";
+}
+
+# SOAP values come as plain value, as { _content => ... } or as a list
+sub content ($v) {
+    $v = $v->[0] if ref $v eq 'ARRAY';
+    $v = $v->{_content} if ref $v eq 'HASH';
+    return $v;
+}
+
+sub fetch ($ua, $cfg, $token, $cal, %query) {
+    my $url = base_url($cfg);
+    push @{$url->path->parts}, 'home', split m{/}, $cal;
+    $url->query(fmt => 'json', %query);
+    my $tx  = $ua->get($url => { Cookie => "ZM_AUTH_TOKEN=$token" });
+    if (my $err = $tx->error) {
+        die(($err->{code} ? "HTTP $err->{code} " : '') . "$err->{message}\n");
+    }
+    my $json = $tx->res->json;
+    die "Unexpected answer from Zimbra (no JSON)\n"
+        unless ref $json eq 'HASH';
+    return $json->{appt} // [];
+}
+
+sub check_calendar ($ua, $cfg, $var, $token, $c) {
+    my $cal   = $c->{path};
+    my $res   = { calendar => $c->{name} // $cal, changes => [] };
+    my $store = $var->child(url_escape($cal, '^A-Za-z0-9\-_.') . '.store');
+    my $now   = time * 1000;
+
+    my $old   = -r $store ? retrieve("$store") : undef;
+    my $mtime = $old ? (stat $store)[9] * 1000 : undef;
+
+    my ($current, $past) = eval {
+        my $cur  = fetch($ua, $cfg, $token, $cal, start => $now);
+        # appointments that moved into the past since the last run are
+        # not deletions, so fetch them as well for the comparison
+        my $past = $mtime ? fetch($ua, $cfg, $token, $cal, start => $mtime, end => $now) : [];
+        ($cur, $past);
+    };
+    if (my $err = $@) {
+        chomp $err;
+        $res->{error} = $err;
+        return $res;
+    }
+
+    my $new = { map { $_->{id} => entry($_) } @$current };
+    $res->{count} = scalar keys %$new;
+
+    unless ($opt{noaction}) {
+        my $tmp = "$store.tmp";
+        nstore($new, $tmp);
+        rename $tmp, "$store" or die "rename $tmp: $!\n";
+    }
+
+    unless ($old) {
+        $res->{initialized} = 1;
+        return $res;
+    }
+
+    my $cmp = { %$new, map { $_->{id} => entry($_) } @$past };
+    my @ch;
+    for my $id (keys %$cmp) {
+        my ($n, $o) = ($cmp->{$id}, $old->{$id});
+        if (not $o) {
+            push @ch, { type => 'new', entry => $n };
+        }
+        elsif ($o->{rev} ne $n->{rev}) {
+            my @diff = grep { ($o->{$_} // '') ne ($n->{$_} // '') }
+                map { $_->[0] } @FIELDS;
+            push @ch, { type => 'changed', entry => $n, old => $o,
+                diff => { map { $_ => 1 } @diff } };
+        }
+    }
+    for my $id (keys %$old) {
+        push @ch, { type => 'deleted', entry => $old->{$id} }
+            unless $cmp->{$id};
+    }
+    $res->{changes} = [ sort {
+        $a->{entry}{sort} cmp $b->{entry}{sort}
+            or $a->{entry}{name} cmp $b->{entry}{name}
+    } @ch ];
+    return $res;
+}
+
+sub entry ($appt) {
+    my $det = $appt->{inv}[0]{comp}[0] // {};
+    my ($s, $e) = ($det->{s}[0], $det->{e}[0]);
+    my $org = $det->{or};
+    my ($start, $end) = (tmfmt($s) // '?', tmfmt($e) // '');
+    if ($det->{allDay} or ($s && !$s->{u} && ($s->{d} // '') =~ /^\d{8}$/)) {
+        $end = '' if $end eq $start;
+        $end .= ' (ganztägig)' if $end;
+        $start .= ' (ganztägig)' unless $end;
+    }
+    return {
+        id      => $appt->{id},
+        rev     => $appt->{rev} // '',
+        sort    => sortkey($s),
+        start   => $start,
+        end     => $end,
+        recur   => $det->{recur} ? 'ja' : '',
+        name    => $det->{name} // '(ohne Titel)',
+        loc     => $det->{loc} // '',
+        org     => $org ? ($org->{d} // $org->{a} // '') : '',
+        changed => tmfmt({ u => $appt->{d} }) // '',
+    };
+}
+
+sub sortkey ($t) {
+    return '' unless $t;
+    my $ms = $t->{u};
+    if (!$ms and ($t->{d} // '') =~ /^(\d{4})(\d\d)(\d\d)(?:T(\d\d)(\d\d))?/) {
+        $ms = POSIX::mktime(0, $5 // 0, $4 // 0, $3, $2 - 1, $1 - 1900) * 1000;
+    }
+    return sprintf '%015d', $ms // 0;
+}
+
+my @WDAY = qw(So Mo Di Mi Do Fr Sa);
+
+sub tmfmt ($t) {
+    return undef unless $t;
+    if ($t->{u}) {
+        my @lt = localtime $t->{u} / 1000;
+        return $WDAY[$lt[6]] . strftime(' %d.%m.%Y %H:%M', @lt);
+    }
+    my $d = $t->{d} // return undef;
+    return "$3.$2.$1" if $d =~ /^(\d{4})(\d\d)(\d\d)$/;
+    return "$3.$2.$1 $4:$5"        if $d =~ /^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)/;
+    return $d;
+}
+
+my %LABEL = (new => 'NEU', changed => 'GEÄNDERT', deleted => 'GELÖSCHT');
+
+sub text_report ($report) {
+    return "\nKeine Änderungen\n\n" unless @$report;
+    my $out = '';
+    for my $r (@$report) {
+        $out .= "\n" . uc($r->{calendar}) . "\n" . ('-' x 60) . "\n";
+        if ($r->{error}) { $out .= "FEHLER: $r->{error}\n"; next }
+        if ($r->{initialized}) {
+            $out .= "Erster Lauf: $r->{count} Termin" . ($r->{count} == 1 ? "" : "e") . " gespeichert.\n"; next;
+        }
+        $out .= "Keine Änderungen\n" unless @{$r->{changes}};
+        for my $c (@{$r->{changes}}) {
+            my $e = $c->{entry};
+            $out .= sprintf "%-9s %s  %s%s\n", $LABEL{$c->{type}},
+                $e->{start} . ($e->{end} ? " - $e->{end}" : ''), $e->{name},
+                $e->{loc} ? " [$e->{loc}]" : '';
+            next unless $c->{type} eq 'changed';
+            for my $f (grep { $c->{diff}{$_->[0]} } @FIELDS) {
+                $out .= sprintf "          %s: %s -> %s\n", $f->[1],
+                    $c->{old}{$f->[0]} || '-', $e->{$f->[0]} || '-';
+            }
+        }
+    }
+    return "$out\n";
+}
+
+sub counts ($report) {
+    my %n = (new => 0, changed => 0, deleted => 0, error => 0);
+    for my $r (@$report) {
+        $n{error}++ if $r->{error};
+        $n{$_->{type}}++ for @{$r->{changes}};
+    }
+    return \%n;
+}
+
+sub subject ($report, $mail) {
+    my $n = counts($report);
+    my @p;
+    push @p, "$n->{new} neu"          if $n->{new};
+    push @p, "$n->{changed} geändert" if $n->{changed};
+    push @p, "$n->{deleted} gelöscht" if $n->{deleted};
+    push @p, "$n->{error} Fehler"     if $n->{error};
+    my $prefix = $mail->{subject} // 'Kalender-Änderungen';
+    return $prefix . ': ' . (@p ? join(', ', @p) : 'keine Änderungen');
+}
+
+my $HTML_TEMPLATE = <<'EOT';
+% my ($report, $n, $fields, $label, $title) = @_;
+% my %col = (new => ['#e6f4ea','#1e7e34'], changed => ['#fff4e0','#b06000'], deleted => ['#fdecea','#c5221f']);
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title><%= $title %></title></head>
+<body style="margin:0;padding:0;background:#f2f4f7;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#202124;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f2f4f7;"><tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;background:#ffffff;border-radius:8px;border:1px solid #dadce0;">
+<tr><td style="padding:20px 24px;border-bottom:1px solid #dadce0;">
+  <div style="font-size:20px;font-weight:600;"><%= $title %></div>
+  <div style="font-size:13px;color:#5f6368;margin-top:4px;"><%= POSIX::strftime('%d.%m.%Y %H:%M', localtime) %></div>
+  <div style="margin-top:12px;font-size:13px;">
+% for my $t (qw(new changed deleted)) {
+    <span style="display:inline-block;margin:0 6px 4px 0;padding:3px 10px;border-radius:12px;background:<%= $col{$t}[0] %>;color:<%= $col{$t}[1] %>;font-weight:600;"><%= $n->{$t} %> <%= lc $label->{$t} %></span>
+% }
+% if ($n->{error}) {
+    <span style="display:inline-block;margin:0 6px 4px 0;padding:3px 10px;border-radius:12px;background:#c5221f;color:#fff;font-weight:600;"><%= $n->{error} %> Fehler</span>
+% }
+  </div>
+</td></tr>
+% unless (@$report) {
+<tr><td style="padding:20px 24px;font-size:14px;color:#5f6368;">Keine Änderungen</td></tr>
+% }
+% for my $r (@$report) {
+<tr><td style="padding:20px 24px 8px 24px;">
+  <div style="font-size:15px;font-weight:600;border-left:4px solid #1a73e8;padding-left:8px;"><%= $r->{calendar} %></div>
+% if ($r->{error}) {
+  <div style="margin-top:10px;padding:10px 12px;background:#fdecea;color:#c5221f;border-radius:6px;font-size:14px;">Fehler: <%= $r->{error} %></div>
+% } elsif ($r->{initialized}) {
+  <div style="margin-top:10px;font-size:14px;color:#5f6368;">Erster Lauf: <%= $r->{count} %> Termin<%= $r->{count} == 1 ? "" : "e" %> gespeichert.</div>
+% } elsif (!@{$r->{changes}}) {
+  <div style="margin-top:10px;font-size:14px;color:#5f6368;">Keine Änderungen</div>
+% } else {
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:10px;border-collapse:collapse;font-size:14px;">
+%   for my $c (@{$r->{changes}}) {
+%     my $e = $c->{entry};
+%     my $del = $c->{type} eq 'deleted' ? 'text-decoration:line-through;color:#80868b;' : '';
+    <tr>
+      <td valign="top" style="padding:10px 10px 10px 0;border-top:1px solid #eceff1;width:84px;">
+        <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;background:<%= $col{$c->{type}}[0] %>;color:<%= $col{$c->{type}}[1] %>;"><%= $label->{$c->{type}} %></span>
+      </td>
+      <td valign="top" style="padding:10px 0;border-top:1px solid #eceff1;">
+        <div style="font-weight:600;<%= $del %>"><%= $e->{name} %><% if ($e->{recur}) { %> <span style="font-weight:400;color:#5f6368;" title="Serientermin">&#x21bb;</span><% } %></div>
+        <div style="color:#3c4043;margin-top:2px;<%= $del %>"><%= $e->{start} %><% if ($e->{end}) { %> &ndash; <%= $e->{end} %><% } %></div>
+%     if ($e->{loc}) {
+        <div style="color:#5f6368;margin-top:2px;<%= $del %>">&#x1F4CD; <%= $e->{loc} %></div>
+%     }
+%     if ($c->{type} eq 'changed' && %{$c->{diff}}) {
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:6px;font-size:13px;border-collapse:collapse;">
+%       for my $f (grep { $c->{diff}{$_->[0]} } @$fields) {
+          <tr>
+            <td style="padding:2px 10px 2px 0;color:#5f6368;"><%= $f->[1] %></td>
+            <td style="padding:2px 6px 2px 0;color:#c5221f;text-decoration:line-through;"><%= $c->{old}{$f->[0]} || '–' %></td>
+            <td style="padding:2px 6px 2px 0;color:#5f6368;">&rarr;</td>
+            <td style="padding:2px 0;color:#1e7e34;font-weight:600;"><%= $e->{$f->[0]} || '–' %></td>
+          </tr>
+%       }
+        </table>
+%     } elsif ($c->{type} eq 'changed') {
+        <div style="font-size:13px;color:#5f6368;margin-top:4px;">Details (Beschreibung, Teilnehmer, …) geändert</div>
+%     }
+      </td>
+    </tr>
+%   }
+  </table>
+% }
+</td></tr>
+% }
+<tr><td style="padding:16px 24px;border-top:1px solid #dadce0;font-size:12px;color:#80868b;">Erzeugt von zimdiff <%= $main::VERSION %></td></tr>
+</table>
+</td></tr></table>
+</body></html>
+EOT
+
+sub html_report ($report, $cfg) {
+    my $title = $cfg->{mail}{subject} // 'Kalender-Änderungen';
+    my $out = Mojo::Template->new(auto_escape => 1)->render($HTML_TEMPLATE,
+        $report, counts($report), \@FIELDS, \%LABEL, $title);
+    die "HTML template: $out" if ref $out;
+    return "$out";
+}
+
+sub mime_header ($str) {
+    return $str if $str =~ /^[\x20-\x7e]*$/;
+    return '=?UTF-8?B?' . encode_base64(encode_utf8($str), '') . '?=';
+}
+
+sub send_mail ($mail, $subject, $text, $html) {
+    my @to   = ref $mail->{to} ? @{$mail->{to}} : ($mail->{to});
+    # mail.from is "addr" or "Display Name <addr>"
+    my $from_cfg = $mail->{from} // ($ENV{USER} // 'zimdiff') . '@localhost';
+    my ($name, $from) = $from_cfg =~ /^\s*"?(.*?)"?\s*<([^>]+)>\s*$/
+        ? ($1, $2) : ('', $from_cfg);
+    my $from_hdr = length $name
+        ? ($name =~ /^[\x20-\x7e]*$/ ? '"' . ($name =~ s/(["\\])/\\$1/gr) . '"'
+                                      : mime_header($name)) . " <$from>"
+        : $from;
+    my $b    = 'zimdiff-' . time . "-$$";
+    my $date = strftime('%a, %d %b %Y %H:%M:%S %z', localtime);
+    my $msg  = join "\r\n",
+        "From: $from_hdr",
+        'To: ' . join(', ', @to),
+        'Subject: ' . mime_header($subject),
+        "Date: $date",
+        'MIME-Version: 1.0',
+        "Content-Type: multipart/alternative; boundary=\"$b\"",
+        '',
+        "--$b",
+        'Content-Type: text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+        '',
+        encode_base64(encode_utf8($text)),
+        "--$b",
+        'Content-Type: text/html; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+        '',
+        encode_base64(encode_utf8($html)),
+        "--$b--",
+        '';
+
+    if (my $smtp = $mail->{smtp}) {
+        require Net::SMTP;
+        my $s = Net::SMTP->new($smtp->{host},
+            Port => $smtp->{port} // ($smtp->{ssl} ? 465 : 25),
+            SSL  => $smtp->{ssl} ? 1 : 0,
+            Timeout => 30,
+        ) or die "SMTP connect to $smtp->{host} failed: $@\n";
+        if ($smtp->{starttls}) {
+            $s->starttls or die "SMTP STARTTLS failed: " . $s->message;
+        }
+        if ($smtp->{user}) {
+            $s->auth($smtp->{user}, $smtp->{password})
+                or die "SMTP auth failed: " . $s->message;
+        }
+        $s->mail($from)    or die "SMTP MAIL FROM failed: " . $s->message;
+        $s->to(@to)        or die "SMTP RCPT TO failed: " . $s->message;
+        $s->data($msg)     or die "SMTP DATA failed: " . $s->message;
+        $s->quit;
+    }
+    else {
+        my $sendmail = $mail->{sendmail} // '/usr/sbin/sendmail';
+        open my $fh, '|-', $sendmail, '-t', '-oi', '-f', $from
+            or die "Cannot run $sendmail: $!\n";
+        print $fh $msg =~ s/\r\n/\n/gr;
+        close $fh or die "$sendmail failed (exit " . ($? >> 8) . ")\n";
+    }
+}
+
+main;
+
+__END__
+
+=head1 NAME
+
+zimdiff - report changes in Zimbra calendars by mail
+
+=head1 SYNOPSIS
+
+B<zimdiff> [I<options>...] [I<calendar>...]
+
+ -c, --config=FILE   config file (default: etc/zimdiff.conf)
+ -n, --no-action     do not update the cache and do not send mail
+ -M, --no-mail       do not send mail
+     --html=FILE     also write the HTML report to FILE
+ -v, --verbose       report whether mail was sent
+     --login         log in interactively (asks for the OTP of
+                     two factor accounts) and store a trusted token
+     --otp=CODE      OTP for --login instead of asking for it
+     --version       print version and exit
+ -h, --help          display this help and exit
+     --man           show man-page and exit
+
+=head1 DESCRIPTION
+
+Shows what has changed in the given calendars (for example
+C<alice@example.com/Calendar>) since the last invocation. Without arguments the
+calendars listed in the config file are checked.
+
+The report is printed to stdout. If C<mail.to> is set in the config file
+and there are changes (or C<mail.always> is true), it is also sent as an
+HTML mail with a plain text alternative.
+
+The config is read from F<etc/zimdiff.conf> and the calendar state is
+kept in F<var/>. In the source tree both are relative to the tree; after
+B<make install> they are under the configured I<sysconfdir> and
+I<localstatedir>.
+
+The first run for a calendar only stores its state and reports the
+number of appointments.
+
+For accounts with two factor authentication run B<zimdiff --login> once on
+a terminal. It asks for the OTP and stores the trusted token returned by
+Zimbra in F<var/zimbra.trusted>. Unattended runs use that token. When it
+expires, the report says so and B<--login> has to be repeated.
+
+=head1 CONFIGURATION
+
+F<etc/zimdiff.conf> is a JSON file, see F<etc/zimdiff.conf.dist>.
+
+  zimbra.url       server, e.g. https://zimbra.example.com
+  zimbra.user      account used to log in (e.g. you@example.com); it
+                   must be able to read the calendars, for example
+                   because they are shared with it
+  zimbra.password  its password
+  calendars        calendars checked when none are given on the
+                   command line, as "owner/Folder" strings or as
+                   objects { "path": "owner/Folder", "name": "Label" }
+  timezone         time zone for the report (e.g. Europe/Zurich)
+  cache_dir        state directory (default: var)
+  mail.to          recipient or list of recipients
+  mail.from        sender, "addr" or "Display Name <addr>"
+  mail.subject     subject prefix
+  mail.always      also send mail when nothing changed
+  mail.sendmail    sendmail binary (default: /usr/sbin/sendmail)
+  mail.smtp        use SMTP instead: host, port, ssl, starttls,
+                   user, password
+
+=head1 EXIT STATUS
+
+0 on success, 2 if a calendar could not be fetched.
+
+=head1 COPYRIGHT
+
+Copyright (c) 2012-2026 OETIKER+PARTNER AG
+
+=head1 LICENSE
+
+MIT, see the LICENSE file.
+
+=head1 HISTORY
+
+ 2012-02-23    Initial version
+ 2026-11-10    Config file, HTML mail, self-contained layout
+
+=cut

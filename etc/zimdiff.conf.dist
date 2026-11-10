@@ -1,0 +1,24 @@
+{
+  "zimbra": {
+    "url": "https://zimbra.example.com",
+    "user": "you@example.com",
+    "password": "secret"
+  },
+  "calendars": [
+    "alice@example.com/Calendar",
+    {
+      "path": "team@example.com/Calendar",
+      "name": "Team"
+    }
+  ],
+  "timezone": "Europe/Zurich",
+  "mail": {
+    "to": [
+      "someone@example.com"
+    ],
+    "from": "Zimbra Calendar Changes <no-reply@example.com>",
+    "subject": "Kalender-Änderungen",
+    "always": false,
+    "smtp": null
+  }
+}
