@@ -4,6 +4,8 @@ Reports changes in Zimbra calendars by mail. Each run compares the
 appointments of the configured calendars with the previous run and sends
 an HTML mail listing new, changed and deleted appointments.
 
+![Example of the report mail](docs/email.png)
+
 ## Install
 
 ```sh

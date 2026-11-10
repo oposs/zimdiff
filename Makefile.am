@@ -6,7 +6,7 @@ dist_bin_SCRIPTS = bin/zimdiff
 dist_sysconf_DATA = etc/zimdiff.conf.dist
 man1_MANS = man/zimdiff.1
 
-EXTRA_DIST = VERSION cpanfile bootstrap README.md LICENSE t/smoke.sh
+EXTRA_DIST = VERSION cpanfile bootstrap README.md LICENSE docs/email.png t/smoke.sh
 
 TESTS = t/smoke.sh
 AM_TESTS_ENVIRONMENT = PERL='$(PERL)'; export PERL;
