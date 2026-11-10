@@ -47,7 +47,7 @@ AC_CHECK_HEADER([openssl/ssl.h],[],[
 if test -x "$WGET"; then
   URL_CAT="$WGET -q -O -"
 elif test -x "$CURL"; then
-  URL_CAT="$CURL --silent --location"
+  URL_CAT="$CURL --fail --silent --location"
 else
   AC_MSG_ERROR([neither curl nor wget found])
 fi

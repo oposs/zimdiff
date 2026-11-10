@@ -9,7 +9,10 @@ man1_MANS = man/zimdiff.1
 EXTRA_DIST = VERSION cpanfile bootstrap README.md LICENSE docs/email.png t/smoke.sh
 
 TESTS = t/smoke.sh
-AM_TESTS_ENVIRONMENT = PERL='$(PERL)'; export PERL;
+AM_TESTS_ENVIRONMENT = PERL='$(PERL)'; THIRDPARTY_LIB='$(abs_top_builddir)/thirdparty/lib/perl5'; export PERL THIRDPARTY_LIB;
+
+# zimdiff keeps its state in a directory of its own below localstatedir
+zimdiffstatedir = $(localstatedir)/zimdiff
 
 CLEANFILES = man/zimdiff.1
 
@@ -20,13 +23,13 @@ man/zimdiff.1: bin/zimdiff VERSION
 install-exec-hook:
 	$(PERL) -i -p \
 	  -e 's{^#!.*perl.*}{#!$(PERL)};' \
-	  -e 's{^use lib .*# LIBDIR}{use lib "$(libdir)"; # LIBDIR};' \
+	  -e 's{^use lib .*# LIBDIR}{use lib "$(pkglibdir)"; # LIBDIR};' \
 	  -e 's{^our \$$VERSION = .*# VERSION}{our \$$VERSION = q{$(PACKAGE_VERSION)}; # VERSION};' \
 	  -e 's{^my %opt = .*# CONFFILE}{my %opt = (config => "$(sysconfdir)/zimdiff.conf"); # CONFFILE};' \
-	  -e 's{^(\s+my \$$var = path\(\$$cfg->\{cache_dir\} // ).*# VARDIR}{$$1"$(localstatedir)"); # VARDIR};' \
+	  -e 's{^(\s+my \$$var = path\(\$$cfg->\{cache_dir\} // ).*# VARDIR}{$$1"$(zimdiffstatedir)"); # VARDIR};' \
 	  "$(DESTDIR)$(bindir)/zimdiff"
 
 # the state directory holds the trusted token, so only the owner may read it
 install-data-local:
-	$(MKDIR_P) "$(DESTDIR)$(localstatedir)"
-	chmod 700 "$(DESTDIR)$(localstatedir)"
+	$(MKDIR_P) "$(DESTDIR)$(zimdiffstatedir)"
+	chmod 700 "$(DESTDIR)$(zimdiffstatedir)"

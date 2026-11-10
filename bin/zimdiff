@@ -16,7 +16,7 @@ use Encode qw(encode_utf8);
 use Getopt::Long 2.25 qw(:config posix_default no_ignore_case);
 use Pod::Usage 1.14;
 
-our $VERSION = '2.0.0'; # VERSION
+our $VERSION = '2.0.1'; # VERSION
 
 my $ROOT = path($FindBin::RealBin)->dirname;
 
@@ -117,7 +117,7 @@ sub main {
     my @mailrep = grep { $_->{error} or $_->{initialized} or @{$_->{changes}} }
         @report;
     my $html = html_report(\@mailrep, $cfg);
-    path($opt{html})->spew(encode_utf8($html)) if $opt{html};
+    write_file($opt{html}, encode_utf8($html)) if $opt{html};
 
     my $mail = $cfg->{mail} // {};
     my $to = ref $mail->{to} ? $mail->{to} : [ $mail->{to} // () ];
@@ -125,11 +125,36 @@ sub main {
         say "(no mail sent)" if $opt{verbose};
     }
     elsif ($changes or $mail->{always}) {
-        send_mail($mail, subject(\@report, $mail), text_report(\@mailrep), $html);
+        # without the mail the changes would be lost: the next run would
+        # compare against the new state, so keep the old one
+        eval { send_mail($mail, subject(\@report, $mail),
+            text_report(\@mailrep), $html); 1 } or do {
+            print STDERR "Sending mail failed, calendar state not updated: $@";
+            exit 1;
+        };
         say "Mail sent to " . join(', ', @$to)
             if $opt{verbose};
     }
+
+    unless ($opt{noaction}) {
+        save_state($_->{save}[0], $_->{save}[1]) for grep { $_->{save} } @report;
+    }
     exit(grep({ $_->{error} } @report) ? 2 : 0);
+}
+
+sub write_file ($file, $bytes, $mode = undef) {
+    my $tmp = "$file.tmp";
+    open my $fh, '>:raw', $tmp or die "Cannot write $tmp: $!\n";
+    chmod $mode, $tmp if defined $mode;
+    print $fh $bytes or die "Cannot write $tmp: $!\n";
+    close $fh or die "Cannot write $tmp: $!\n";
+    rename $tmp, $file or die "Cannot rename $tmp: $!\n";
+}
+
+sub save_state ($store, $data) {
+    my $tmp = "$store.tmp";
+    nstore($data, $tmp);
+    rename $tmp, "$store" or die "Cannot rename $tmp: $!\n";
 }
 
 sub load_config ($file) {
@@ -182,8 +207,7 @@ sub login ($ua, $cfg, $var, $interactive = 0) {
             twoFactorCode => { _content => $otp }, deviceTrusted => 1 });
         my $new = content($auth->{trustedToken})
             or die "Zimbra did not return a trusted token\n";
-        my $tmp = $var->child('zimbra.trusted.tmp');
-        $tmp->spew($new)->chmod(0600)->move_to($trusted);
+        write_file("$trusted", $new, 0600);
     }
     my $token = content($auth->{authToken});
     die "Zimbra did not return an auth token\n" unless $token;
@@ -234,7 +258,12 @@ sub check_calendar ($ua, $cfg, $var, $token, $c) {
     my $store = $var->child(url_escape($cal, '^A-Za-z0-9\-_.') . '.store');
     my $now   = time * 1000;
 
-    my $old   = -r $store ? retrieve("$store") : undef;
+    my $old = eval { -r $store ? retrieve("$store") : undef };
+    if (my $err = $@) {
+        chomp $err;
+        $res->{error} = "Cannot read state $store: $err";
+        return $res;
+    }
     my $mtime = $old ? (stat $store)[9] * 1000 : undef;
 
     my ($current, $past) = eval {
@@ -253,11 +282,7 @@ sub check_calendar ($ua, $cfg, $var, $token, $c) {
     my $new = { map { $_->{id} => entry($_) } @$current };
     $res->{count} = scalar keys %$new;
 
-    unless ($opt{noaction}) {
-        my $tmp = "$store.tmp";
-        nstore($new, $tmp);
-        rename $tmp, "$store" or die "rename $tmp: $!\n";
-    }
+    $res->{save} = [ $store, $new ];
 
     unless ($old) {
         $res->{initialized} = 1;
@@ -269,18 +294,24 @@ sub check_calendar ($ua, $cfg, $var, $token, $c) {
     for my $id (keys %$cmp) {
         my ($n, $o) = ($cmp->{$id}, $old->{$id});
         if (not $o) {
-            push @ch, { type => 'new', entry => $n };
+            push @ch, { type => 'new', entry => view($n) };
         }
         elsif ($o->{rev} ne $n->{rev}) {
-            my @diff = grep { ($o->{$_} // '') ne ($n->{$_} // '') }
+            # both sides are formatted now, in the same language
+            my ($nv, $ov) = (view($n), view($o));
+            my @diff = grep { ($ov->{$_} // '') ne ($nv->{$_} // '') }
                 @FIELDS;
-            push @ch, { type => 'changed', entry => $n, old => $o,
+            push @ch, { type => 'changed', entry => $nv, old => $ov,
                 diff => { map { $_ => 1 } @diff } };
         }
     }
     for my $id (keys %$old) {
-        push @ch, { type => 'deleted', entry => $old->{$id} }
-            unless $cmp->{$id};
+        next if $cmp->{$id};
+        # an appointment that is over drops out of the query without being
+        # deleted; it showed up as deleted when it ended after the last run
+        my $end = end_ms($old->{$id});
+        next if defined $end and $end <= $now;
+        push @ch, { type => 'deleted', entry => view($old->{$id}) };
     }
     $res->{changes} = [ sort {
         $a->{entry}{sort} cmp $b->{entry}{sort}
@@ -289,28 +320,54 @@ sub check_calendar ($ua, $cfg, $var, $token, $c) {
     return $res;
 }
 
+# the state keeps the raw values; view() formats them for the report, so
+# a change of the report language does not show up as a changed field
 sub entry ($appt) {
     my $det = $appt->{inv}[0]{comp}[0] // {};
     my ($s, $e) = ($det->{s}[0], $det->{e}[0]);
     my $org = $det->{or};
-    my ($start, $end) = (tmfmt($s) // '?', tmfmt($e) // '');
-    if ($det->{allDay} or ($s && !$s->{u} && ($s->{d} // '') =~ /^\d{8}$/)) {
+    my $time = sub ($t) { $t ? { map { $_ => $t->{$_} } grep { defined $t->{$_} } qw(u d) } : undef };
+    return {
+        v      => 2,
+        id     => $appt->{id},
+        rev    => $appt->{rev} // '',
+        s      => $time->($s),
+        e      => $time->($e),
+        allday => ($det->{allDay} or ($s && !$s->{u} && ($s->{d} // '') =~ /^\d{8}$/)) ? 1 : 0,
+        recur  => $det->{recur} ? 1 : 0,
+        name   => $det->{name},
+        loc    => $det->{loc} // '',
+        org    => $org ? ($org->{d} // $org->{a} // '') : '',
+    };
+}
+
+sub view ($x) {
+    # state written by zimdiff 2.0.0 holds formatted text already
+    return { sort => '', %$x } unless $x->{v};
+    my ($start, $end) = (tmfmt($x->{s}) // '?', tmfmt($x->{e}) // '');
+    if ($x->{allday}) {
         $end = '' if $end eq $start;
         $end .= ' (' . t('all_day') . ')' if $end;
         $start .= ' (' . t('all_day') . ')' unless $end;
     }
     return {
-        id      => $appt->{id},
-        rev     => $appt->{rev} // '',
-        sort    => sortkey($s),
-        start   => $start,
-        end     => $end,
-        recur   => $det->{recur} ? t('yes') : '',
-        name    => $det->{name} // t('untitled'),
-        loc     => $det->{loc} // '',
-        org     => $org ? ($org->{d} // $org->{a} // '') : '',
-        changed => tmfmt({ u => $appt->{d} }) // '',
+        sort  => sortkey($x->{s}),
+        start => $start,
+        end   => $end,
+        recur => $x->{recur} ? t('yes') : '',
+        name  => $x->{name} // t('untitled'),
+        loc   => $x->{loc},
+        org   => $x->{org},
     };
+}
+
+# end of an appointment in ms; an all-day end date counts to the end of the day
+sub end_ms ($x) {
+    return $x->{sort} ? 0 + $x->{sort} : undef unless $x->{v};  # 2.0.0 state: start only
+    my $t = $x->{e} // $x->{s} // return undef;
+    return $t->{u} if $t->{u};
+    my $ms = 0 + sortkey($t) or return undef;
+    return ($t->{d} // '') =~ /^\d{8}$/ ? $ms + 86_400_000 : $ms;
 }
 
 sub sortkey ($t) {
@@ -481,7 +538,12 @@ sub send_mail ($mail, $subject, $text, $html) {
                                       : mime_header($name)) . " <$from>"
         : $from;
     my $b    = 'zimdiff-' . time . "-$$";
-    my $date = strftime('%a, %d %b %Y %H:%M:%S %z', localtime);
+    # %a and %b follow LC_TIME, the Date header needs the English names
+    my @lt   = localtime;
+    my $date = sprintf '%s, %02d %s %04d %s',
+        (qw(Sun Mon Tue Wed Thu Fri Sat))[$lt[6]], $lt[3],
+        (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[$lt[4]],
+        $lt[5] + 1900, strftime('%H:%M:%S %z', @lt);
     my $msg  = join "\r\n",
         "From: $from_hdr",
         'To: ' . join(', ', @to),
@@ -568,7 +630,7 @@ HTML mail with a plain text alternative.
 The config is read from F<etc/zimdiff.conf> and the calendar state is
 kept in F<var/>. In the source tree both are relative to the tree; after
 B<make install> they are under the configured I<sysconfdir> and
-I<localstatedir>.
+I<localstatedir>F</zimdiff>.
 
 The first run for a calendar only stores its state and reports the
 number of appointments.
@@ -582,8 +644,8 @@ expires, the report says so and B<--login> has to be repeated.
 
 F<etc/zimdiff.conf> is a JSON file, see F<etc/zimdiff.conf.dist>.
 
-  zimbra.url       server, e.g. https://zimbra.example.com
-  zimbra.user      account used to log in (e.g. you@example.com); it
+  zimbra.url       server, for example https://zimbra.example.com
+  zimbra.user      account used to log in, for example you@example.com; it
                    must be able to read the calendars, for example
                    because they are shared with it
   zimbra.password  its password
@@ -621,5 +683,6 @@ The initial code was written by Tobi Oetiker E<lt>tobi@oetiker.chE<gt>.
 
  2012-02-23    Initial version
  2026-11-10    Config file, HTML mail, self-contained layout
+ 2026-11-10    2.0.1: state keeps raw values, mail before saving state
 
 =cut
