@@ -28,9 +28,23 @@ $EDITOR etc/zimdiff.conf
 bin/zimdiff            # first run stores the current state
 ```
 
-zimdiff reads the calendars through CalDAV. If the account uses two factor
-authentication, create an application passcode in the Zimbra preferences and
-put it in `zimbra.password`.
+zimdiff reads the calendars through CalDAV, logged in as `zimbra.user`. The
+calendars of other accounts must be shared with that account.
+
+### Accounts with two factor authentication
+
+An account with two factor authentication needs an application passcode;
+its regular password with an OTP does not work for zimdiff.
+
+1. In the Zimbra web client, open Preferences, Accounts.
+2. Under Two-step authentication, next to Applications, choose
+   Add Application Code.
+3. Enter a name, for example `zimdiff`, and choose Next.
+4. Copy the passcode; Zimbra shows it only once.
+5. Put it in `etc/zimdiff.conf` as `zimbra.password`.
+
+Zimbra accepts application passcodes for CalDAV, but not for its web client,
+SOAP or REST interfaces. To revoke the passcode, remove it from the same list.
 
 Run it from cron, for example daily at 07:00:
 

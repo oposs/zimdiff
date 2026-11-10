@@ -652,9 +652,14 @@ I<localstatedir>F</zimdiff>.
 The first run for a calendar only stores its state and reports the
 number of appointments.
 
-zimdiff reads the calendars through CalDAV. For an account with two factor
-authentication, create an application passcode in the Zimbra preferences
-and use it as C<zimbra.password>.
+zimdiff reads the calendars through CalDAV, logged in as C<zimbra.user>.
+The calendars of other accounts must be shared with that account.
+
+An account with two factor authentication needs an application passcode as
+C<zimbra.password>. It is created in the Zimbra web client under
+Preferences, Accounts, Two-step authentication, Applications, Add
+Application Code. Zimbra shows the passcode only once, and accepts it for
+CalDAV but not for its web client, SOAP or REST interfaces.
 
 =head1 CONFIGURATION
 
