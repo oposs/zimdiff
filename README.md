@@ -46,11 +46,15 @@ its regular password with an OTP does not work for zimdiff.
 Zimbra accepts application passcodes for CalDAV, but not for its web client,
 SOAP or REST interfaces. To revoke the passcode, remove it from the same list.
 
-Run it from cron, for example daily at 07:00:
+To run it daily at 07:00 from a systemd user timer:
 
 ```
-0 7 * * * /opt/zimdiff/bin/zimdiff > /dev/null
+/opt/zimdiff/bin/zimdiff --install-service
+loginctl enable-linger    # also run while you are logged out
 ```
+
+`--install-service=18:30` picks another time, `--uninstall-service`
+removes the timer again.
 
 `bin/zimdiff --man` documents the options and config keys.
 
